@@ -438,6 +438,8 @@ class ServiceProcessController(QObject):
         self.owns_process = False
 
     def start(self):
+        if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
+            return
         if self._port_open(config.app_port):
             self.status_changed.emit("external")
             return
@@ -445,14 +447,19 @@ class ServiceProcessController(QObject):
         self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self.process.setWorkingDirectory(os.path.abspath("."))
         self.process.setProcessEnvironment(QProcessEnvironment.systemEnvironment())
+        service_arguments = ["--parent-pid", str(os.getpid())]
         if getattr(sys, "frozen", False):
             self.process.setProgram(sys.executable)
-            self.process.setArguments(["--service"])
+            self.process.setArguments(["--service", *service_arguments])
         else:
             self.process.setProgram(sys.executable)
-            self.process.setArguments([os.path.abspath("service/app.py")])
+            self.process.setArguments([
+                os.path.abspath("service/app.py"),
+                *service_arguments,
+            ])
         environment = self.process.processEnvironment()
         environment.insert("IPTV_API_SKIP_VERSION_CHECK", "1")
+        environment.insert("PYTHONIOENCODING", "utf-8:replace")
         self.process.setProcessEnvironment(environment)
         self.process.readyReadStandardOutput.connect(self._read_output)
         self.process.started.connect(lambda: self.status_changed.emit("running"))

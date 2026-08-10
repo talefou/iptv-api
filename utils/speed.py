@@ -1,6 +1,7 @@
 import asyncio
 import http.cookies
 import re
+import socket
 from collections import deque
 from contextlib import asynccontextmanager
 from time import time
@@ -46,6 +47,8 @@ stability_window = 4
 stability_threshold = 0.12
 segment_sample_limit = 2
 playlist_max_bytes = 2 * 1024 * 1024
+stream_sample_max_bytes = 4 * 1024 * 1024
+stream_sample_max_seconds = 2.0
 
 ad_filter_keywords = [
     "no_signal",
@@ -65,8 +68,43 @@ ad_filter_keywords = [
 ad_max_loop_duration = 90
 
 
+def _is_aiohttp_dns_shield_error(context: dict) -> bool:
+    exception = context.get("exception")
+    if not isinstance(exception, socket.gaierror):
+        return False
+    if context.get("message") != "gaierror exception in shielded future":
+        return False
+    future = context.get("future")
+    get_coro = getattr(future, "get_coro", None)
+    if not callable(get_coro):
+        return False
+    coro = get_coro()
+    return getattr(coro, "__qualname__", "").endswith(
+        "TCPConnector._resolve_host_with_throttle"
+    )
+
+
+def _install_aiohttp_dns_error_filter() -> None:
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    if getattr(previous_handler, "_filters_aiohttp_dns_shield_errors", False):
+        return
+
+    def handle_exception(active_loop, context):
+        if _is_aiohttp_dns_shield_error(context):
+            return
+        if previous_handler is not None:
+            previous_handler(active_loop, context)
+        else:
+            active_loop.default_exception_handler(context)
+
+    handle_exception._filters_aiohttp_dns_shield_errors = True
+    loop.set_exception_handler(handle_exception)
+
+
 def create_speed_test_session(concurrency: int):
     limit = max(1, int(concurrency or 1))
+    _install_aiohttp_dns_error_filter()
     return ClientSession(
         connector=TCPConnector(ssl=False, limit=limit, limit_per_host=min(2, limit), ttl_dns_cache=300),
         timeout=ClientTimeout(total=None),
@@ -93,7 +131,9 @@ async def _session(session, concurrency: int = 1):
 
 
 async def get_speed_with_download(url: str, headers: dict = None, session: Any = None,
-                                  timeout: int = speed_test_timeout, semaphore=None) -> dict[str, float | None]:
+                                  timeout: int = speed_test_timeout, semaphore=None,
+                                  max_bytes: int | None = None,
+                                  max_duration: float | None = None) -> dict[str, float | None]:
     """
     Get the speed of the url with a total timeout
     """
@@ -103,6 +143,9 @@ async def get_speed_with_download(url: str, headers: dict = None, session: Any =
     min_bytes = 64 * 1024
     last_sample_time = start_time
     last_sample_size = 0
+    max_bytes = stream_sample_max_bytes if max_bytes is None else max_bytes
+    max_duration = stream_sample_max_seconds if max_duration is None else max_duration
+    request_timeout = min(timeout, max_duration) if max_duration else timeout
 
     if session is None:
         session = ClientSession(connector=TCPConnector(ssl=False), trust_env=True)
@@ -113,11 +156,13 @@ async def get_speed_with_download(url: str, headers: dict = None, session: Any =
     speed_samples = deque(maxlen=stability_window)
     try:
         async with _limit(semaphore):
-            async with session.get(url, headers=headers, timeout=timeout) as response:
+            start_time = time()
+            last_sample_time = start_time
+            async with session.get(url, headers=headers, timeout=request_timeout) as response:
                 if response.status != 200:
                     raise Exception("Invalid response")
                 delay = int(round((time() - start_time) * 1000))
-                async for chunk in response.content.iter_any():
+                async for chunk in response.content.iter_chunked(64 * 1024):
                     if chunk:
                         total_size += len(chunk)
                         now = time()
@@ -129,6 +174,15 @@ async def get_speed_with_download(url: str, headers: dict = None, session: Any =
                             speed_samples.append(inst_speed)
                             last_sample_time = now
                             last_sample_size = total_size
+                        if (max_bytes and total_size >= max_bytes) or (
+                                max_duration and elapsed >= max_duration
+                        ):
+                            return {
+                                'speed': total_size / elapsed / 1024 / 1024 if elapsed > 0 else 0.0,
+                                'delay': delay,
+                                'size': total_size,
+                                'time': elapsed,
+                            }
                         if (elapsed >= min_measure_time and total_size >= min_bytes
                                 and len(speed_samples) >= stability_window):
                             mean = sum(speed_samples) / len(speed_samples)
